@@ -5,3 +5,4 @@ def test():
 
 print(test())
 print("Test completed.")
+print(2)
