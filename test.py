@@ -8,3 +8,4 @@ print('111')
 print("LLLL")
 print("Q")
 #₹
+print("")
