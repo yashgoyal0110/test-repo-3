@@ -22,14 +22,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Log environment
-        run: |
-          echo "[SETUP] ========================================"
-          echo "[SETUP] Base branch updated: ${{ github.ref_name }}"
-          echo "[SETUP] Commit SHA: ${{ github.sha }}"
-          echo "[SETUP] Repository: ${{ github.repository }}"
-          echo "[SETUP] ========================================"
-
       - name: Get open PRs targeting this branch
         id: get-prs
         env:
@@ -72,18 +64,12 @@ jobs:
           BASE_REF="${{ github.event.pull_request.base.ref }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
 
-          # ----------------------------------------
-          # Fetch latest base branch commit
-          # ----------------------------------------
           echo "[CHECK] Fetching latest base branch: ${BASE_REF}"
           git fetch origin "${BASE_REF}"
 
           BASE_SHA=$(git rev-parse "origin/${BASE_REF}")
           echo "[CHECK] Latest base SHA: ${BASE_SHA}"
 
-          # ----------------------------------------
-          # Fetch authoritative PR head (latest)
-          # ----------------------------------------
           PR_DATA=$(gh pr view "$PR_NUMBER" --json headRefName,headRefOid,title)
 
           PR_HEAD_REF=$(echo "$PR_DATA" | jq -r '.headRefName')
@@ -95,9 +81,6 @@ jobs:
           # Fetch PR commit directly (works for forks)
           git fetch origin "${PR_HEAD_SHA}"
 
-          # ----------------------------------------
-          # List changed files (informational)
-          # ----------------------------------------
           echo "[CHECK] Fetching changed files in PR"
           gh pr view "$PR_NUMBER" --json files --jq '.files[].path' > pr_files.txt
 
@@ -112,16 +95,13 @@ jobs:
           echo "[CHECK] Changed files:"
           sed 's/^/[CHECK]   - /' pr_files.txt
 
-          # ----------------------------------------
-          # Conflict detection (NO MERGE)
-          # ----------------------------------------
           echo "[CHECK] Running merge-tree conflict analysis"
 
-          MERGE_OUTPUT=$(git merge-tree "$BASE_SHA" "$PR_HEAD_SHA")
+          set +e
+          MERGE_OUTPUT=$(git merge-tree "$BASE_SHA" "$PR_HEAD_SHA" 2>&1)
+          MERGE_EXIT_CODE=$?
+          set -e
 
-          # ----------------------------------------
-          # Results
-          # ----------------------------------------
           echo "[RESULT] ========================================"
           echo "[RESULT] CONFLICT DETECTION SUMMARY"
           echo "[RESULT] ========================================"
@@ -132,9 +112,15 @@ jobs:
           echo "[RESULT] Total files changed: ${FILE_COUNT}"
           echo "[RESULT] ========================================"
 
-          if echo "$MERGE_OUTPUT" | grep -q "<<<<<<<"; then
+          # Check for conflicts in merge-tree output
+          if echo "$MERGE_OUTPUT" | grep -q "CONFLICT"; then
             echo "[RESULT] ❌ STATUS: FAILED"
             echo "[RESULT] Merge conflicts detected with latest base branch"
+            echo "$MERGE_OUTPUT" | grep "CONFLICT" | sed 's/^/[RESULT]   /'
+            exit 1
+          elif [ "$MERGE_EXIT_CODE" -ne 0 ]; then
+            echo "[RESULT] ⚠️  WARNING: Merge-tree exited with code ${MERGE_EXIT_CODE}"
+            echo "[RESULT] This may indicate a conflict or error"
             exit 1
           else
             echo "[RESULT] ✅ STATUS: PASSED"
@@ -168,26 +154,43 @@ jobs:
             echo "[CHECK-ALL] Base: ${PR_BASE_REF}"
             echo "[CHECK-ALL] Head: ${PR_HEAD_REF} @ ${PR_HEAD_SHA}"
 
-            echo "[CHECK-ALL] Fetching branches..."
-            git fetch origin ${PR_BASE_REF} >/dev/null 2>&1 || true
-            git fetch origin ${PR_HEAD_SHA} >/dev/null 2>&1 || true
+            echo "[CHECK-ALL] Fetching latest branches..."
+            git fetch origin ${PR_BASE_REF} >/dev/null 2>&1
+            
+            # Fetch the PR head commit directly (works for forks)
+            git fetch origin ${PR_HEAD_SHA} >/dev/null 2>&1
 
             # Get latest base SHA
             LATEST_BASE_SHA=$(git rev-parse origin/${PR_BASE_REF})
             echo "[CHECK-ALL] Latest base SHA: ${LATEST_BASE_SHA}"
+            echo "[CHECK-ALL] PR head SHA: ${PR_HEAD_SHA}"
 
-            # Checkout base and attempt merge
-            git checkout -B __tmp_base "${LATEST_BASE_SHA}" >/dev/null 2>&1
-
+            # Use git merge-tree to check for conflicts
+            echo "[CHECK-ALL] Running merge simulation..."
             set +e
-            git merge --no-commit --no-ff "${PR_HEAD_SHA}" >/tmp/merge_${pr_number}.log 2>&1
+            MERGE_OUTPUT=$(git merge-tree ${LATEST_BASE_SHA} ${PR_HEAD_SHA} 2>&1)
             MERGE_EXIT_CODE=$?
             set -e
 
             CHECK_NAME="Merge Conflict Detector"
+            HAS_CONFLICT=false
 
-            if [ "$MERGE_EXIT_CODE" -ne 0 ]; then
-              echo "[CHECK-ALL] ❌ Merge conflict detected in PR #${pr_number}"
+            # Check for "CONFLICT" in the output (most reliable indicator)
+            if echo "$MERGE_OUTPUT" | grep -q "CONFLICT"; then
+              HAS_CONFLICT=true
+              echo "[CHECK-ALL] ❌ Conflict detected via merge-tree output"
+              echo "$MERGE_OUTPUT" | grep "CONFLICT" | sed 's/^/[CHECK-ALL]   /'
+            # Exit code 1 from merge-tree also indicates conflicts
+            elif [ "$MERGE_EXIT_CODE" -eq 1 ]; then
+              HAS_CONFLICT=true
+              echo "[CHECK-ALL] ❌ Conflict detected via merge-tree exit code"
+            else
+              echo "[CHECK-ALL] ✅ No conflicts detected"
+            fi
+
+            # Post check run status (suppress JSON output)
+            if [ "$HAS_CONFLICT" = true ]; then
+              echo "[CHECK-ALL] ❌ Posting failure status for PR #${pr_number}"
 
               gh api repos/${{ github.repository }}/check-runs \
                 -X POST \
@@ -196,13 +199,14 @@ jobs:
                 -f status="completed" \
                 -f conclusion="failure" \
                 -f "output[title]=Merge conflicts detected" \
-                -f "output[summary]=This PR has merge conflicts with ${PR_BASE_REF}. Please update your branch."
+                -f "output[summary]=This PR has merge conflicts with ${PR_BASE_REF}. Please update your branch." \
+                --silent
 
               FAILED=true
               CONFLICT_SUMMARY="${CONFLICT_SUMMARY}
             PR #${pr_number}: ${PR_TITLE}"
             else
-              echo "[CHECK-ALL] ✅ No conflicts"
+              echo "[CHECK-ALL] ✅ Posting success status for PR #${pr_number}"
 
               gh api repos/${{ github.repository }}/check-runs \
                 -X POST \
@@ -211,24 +215,23 @@ jobs:
                 -f status="completed" \
                 -f conclusion="success" \
                 -f "output[title]=No merge conflicts" \
-                -f "output[summary]=This PR cleanly merges into ${PR_BASE_REF}"
+                -f "output[summary]=This PR cleanly merges into ${PR_BASE_REF}" \
+                --silent
             fi
 
-            git merge --abort >/dev/null 2>&1 || true
           done < pr_numbers.txt
 
           echo "[CHECK-ALL] ========================================"
           if [ "$FAILED" = true ]; then
-            echo "[CHECK-ALL] ========================================"
+            echo "[CHECK-ALL] ⚠️  CONFLICTS DETECTED"
             echo "[CHECK-ALL] The following PRs have merge conflicts:"
             echo "${CONFLICT_SUMMARY}"
             echo "[CHECK-ALL] ========================================"
             echo "[CHECK-ALL] Check runs have been posted to each PR"
             echo "[CHECK-ALL] ========================================"
-            # This job now exits with failure when conflicts are detected
             exit 0
           else
-            echo "[CHECK-ALL] ✅ WORKFLOW PASSED - NO CONFLICTS"
+            echo "[CHECK-ALL] ✅ ALL PRs CLEAN"
             echo "[CHECK-ALL] All open PRs merge cleanly into ${{ github.ref_name }}"
             echo "[CHECK-ALL] ========================================"
             exit 0
