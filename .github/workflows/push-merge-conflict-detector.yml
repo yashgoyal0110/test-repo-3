@@ -1,0 +1,102 @@
+name: Push Merge Conflict Detector
+
+on:
+  push:
+    branches: [main, develop]
+  workflow_call:
+
+jobs:
+  detect-conflicts:
+    name: Check Open PRs for Conflicts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get open PRs targeting this branch
+        id: get-prs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr list \
+            --base "${{ github.ref_name }}" \
+            --state open \
+            --json number \
+            --jq '.[].number' > pr_numbers.txt
+
+          COUNT=$(wc -l < pr_numbers.txt | tr -d ' ')
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Check all open PRs
+        if: steps.get-prs.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          FAILED=false
+
+          while IFS= read -r PR; do
+            echo "Checking PR #$PR"
+
+            DATA=$(gh pr view "$PR" --json headRefName,headRefOid,baseRefName,title)
+
+            HEAD_SHA=$(echo "$DATA" | jq -r '.headRefOid')
+            BASE_REF=$(echo "$DATA" | jq -r '.baseRefName')
+
+            git fetch origin "$BASE_REF"
+            git fetch origin "$HEAD_SHA"
+
+            BASE_SHA=$(git rev-parse "origin/$BASE_REF")
+
+            set +e
+            OUTPUT=$(git merge-tree "$BASE_SHA" "$HEAD_SHA" 2>&1)
+            CODE=$?
+            set -e
+
+            HAS_CONFLICT=false
+
+            if echo "$OUTPUT" | grep -q "CONFLICT" || [ "$CODE" -eq 1 ]; then
+              HAS_CONFLICT=true
+            fi
+
+            CHECK_NAME="Merge Conflict Detector"
+
+            if [ "$HAS_CONFLICT" = true ]; then
+              echo "❌ Conflict in PR #$PR"
+
+              gh api repos/${{ github.repository }}/check-runs \
+                -X POST \
+                -f name="$CHECK_NAME" \
+                -f head_sha="$HEAD_SHA" \
+                -f status="completed" \
+                -f conclusion="failure" \
+                -f "output[title]=Merge conflicts detected" \
+                -f "output[summary]=Please update your branch." \
+                --silent
+
+              FAILED=true
+            else
+              echo "✅ Clean PR #$PR"
+
+              gh api repos/${{ github.repository }}/check-runs \
+                -X POST \
+                -f name="$CHECK_NAME" \
+                -f head_sha="$HEAD_SHA" \
+                -f status="completed" \
+                -f conclusion="success" \
+                -f "output[title]=No merge conflicts" \
+                -f "output[summary]=PR merges cleanly." \
+                --silent
+            fi
+
+          done < pr_numbers.txt
+
+          if [ "$FAILED" = true ]; then
+            echo "Some PRs have conflicts"
+          else
+            echo "All PRs clean"
+          fi

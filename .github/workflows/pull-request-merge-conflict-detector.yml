@@ -1,0 +1,60 @@
+name: PR Merge Conflict Detector
+
+on:
+  workflow_call:
+  pull_request_target:
+
+jobs:
+  detect-merge-conflict:
+    name: Check PR for Merge Conflicts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check PR for merge conflicts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "[CHECK] ========================================"
+          echo "[CHECK] Checking PR #${{ github.event.pull_request.number }}"
+
+          BASE_REF="${{ github.event.pull_request.base.ref }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          git fetch origin "${BASE_REF}"
+          BASE_SHA=$(git rev-parse "origin/${BASE_REF}")
+
+          PR_DATA=$(gh pr view "$PR_NUMBER" --json headRefName,headRefOid,title)
+
+          PR_HEAD_REF=$(echo "$PR_DATA" | jq -r '.headRefName')
+          PR_HEAD_SHA=$(echo "$PR_DATA" | jq -r '.headRefOid')
+          PR_TITLE=$(echo "$PR_DATA" | jq -r '.title')
+
+          git fetch origin "${PR_HEAD_SHA}"
+
+          echo "[CHECK] Running merge-tree analysis..."
+
+          set +e
+          MERGE_OUTPUT=$(git merge-tree "$BASE_SHA" "$PR_HEAD_SHA" 2>&1)
+          MERGE_EXIT_CODE=$?
+          set -e
+
+          echo "[RESULT] ========================================"
+          printf "[RESULT] PR #%s: %s\n" "$PR_NUMBER" "$PR_TITLE"
+
+          if echo "$MERGE_OUTPUT" | grep -q "CONFLICT"; then
+            echo "[RESULT] ❌ Merge conflicts detected"
+            echo "$MERGE_OUTPUT" | grep "CONFLICT"
+            exit 1
+          elif [ "$MERGE_EXIT_CODE" -ne 0 ]; then
+            echo "[RESULT] ⚠️ merge-tree exited with error"
+            exit 1
+          else
+            echo "[RESULT] ✅ No conflicts"
+          fi
