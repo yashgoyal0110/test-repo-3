@@ -9,6 +9,10 @@ jobs:
   detect-conflicts:
     name: Check Open PRs for Conflicts
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
 
     steps:
       - name: Checkout repository
@@ -21,6 +25,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+
           gh pr list \
             --base "${{ github.ref_name }}" \
             --state open \
@@ -40,63 +46,174 @@ jobs:
           FAILED=false
 
           while IFS= read -r PR; do
+            echo "========================================"
             echo "Checking PR #$PR"
+            echo "========================================"
 
-            DATA=$(gh pr view "$PR" --json headRefName,headRefOid,baseRefName,title)
+            # ── Fetch PR metadata ──────────────────────────────────────────
+            DATA=$(gh pr view "$PR" --json headRefName,headRefOid,baseRefName,title,files)
 
             HEAD_SHA=$(echo "$DATA" | jq -r '.headRefOid')
+            HEAD_REF=$(echo "$DATA" | jq -r '.headRefName')
             BASE_REF=$(echo "$DATA" | jq -r '.baseRefName')
+            TITLE=$(echo   "$DATA" | jq -r '.title')
+
+            # Files actually touched by the PR (paths only)
+            PR_FILES=$(echo "$DATA" | jq -r '.files[].path')
+            TOTAL_FILES=$(echo "$PR_FILES" | grep -c . || true)
+
+            echo "  Title    : $TITLE"
+            echo "  Base ref : $BASE_REF"
+            echo "  Head ref : $HEAD_REF"
+            echo "  Head SHA : $HEAD_SHA"
+            echo "  PR files : $TOTAL_FILES"
 
             git fetch origin "$BASE_REF"
             git fetch origin "$HEAD_SHA"
 
             BASE_SHA=$(git rev-parse "origin/$BASE_REF")
+            echo "  Base SHA : $BASE_SHA"
 
+            # ── Run merge-tree ─────────────────────────────────────────────
             set +e
-            OUTPUT=$(git merge-tree "$BASE_SHA" "$HEAD_SHA" 2>&1)
-            CODE=$?
+            MERGE_OUTPUT=$(git merge-tree "$BASE_SHA" "$HEAD_SHA" 2>&1)
+            MERGE_CODE=$?
             set -e
 
-            HAS_CONFLICT=false
+            # ── Collect ALL conflicted paths from merge-tree output ────────
+            # Lines like: "CONFLICT (content): Merge conflict in path/to/file"
+            ALL_CONFLICTED_FILES=""
+            if [ -n "$MERGE_OUTPUT" ]; then
+              ALL_CONFLICTED_FILES=$(echo "$MERGE_OUTPUT" \
+                | grep -oP '(?<=Merge conflict in ).*' || true)
+            fi
 
-            if echo "$OUTPUT" | grep -q "CONFLICT" || [ "$CODE" -eq 1 ]; then
-              HAS_CONFLICT=true
+            # ── Cross-reference: keep only files the PR actually changed ──
+            RELEVANT_CONFLICTS=""
+            if [ -n "$ALL_CONFLICTED_FILES" ]; then
+              while IFS= read -r CF; do
+                if echo "$PR_FILES" | grep -qxF "$CF"; then
+                  RELEVANT_CONFLICTS="${RELEVANT_CONFLICTS}${CF}"$'\n'
+                fi
+              done <<< "$ALL_CONFLICTED_FILES"
+            fi
+
+            RELEVANT_CONFLICTS=$(echo "$RELEVANT_CONFLICTS" | sed '/^$/d')
+            CONFLICT_COUNT=$(echo "$RELEVANT_CONFLICTS" | grep -c . || true)
+
+            HAS_RELEVANT_CONFLICT=false
+            if [ "$CONFLICT_COUNT" -gt 0 ]; then
+              HAS_RELEVANT_CONFLICT=true
             fi
 
             CHECK_NAME="Merge Conflict Detector"
 
-            if [ "$HAS_CONFLICT" = true ]; then
-              echo "❌ Conflict in PR #$PR"
+            # ── Build structured log + summary ────────────────────────────
+            if [ "$HAS_RELEVANT_CONFLICT" = true ]; then
+              echo "❌  PR #$PR has $CONFLICT_COUNT relevant conflict(s)"
 
-              gh api repos/${{ github.repository }}/check-runs \
+              # --- structured console log ---
+              echo ""
+              echo "  [CONFLICT DETAILS]"
+              echo "  PR number           : #$PR"
+              echo "  PR title            : $TITLE"
+              echo "  Base ref            : $BASE_REF  ($BASE_SHA)"
+              echo "  Head ref            : $HEAD_REF  ($HEAD_SHA)"
+              echo "  Total files changed : $TOTAL_FILES"
+              echo "  Conflicted files    : $CONFLICT_COUNT"
+              while IFS= read -r CF; do
+                echo "    - $CF"
+              done <<< "$RELEVANT_CONFLICTS"
+              echo ""
+
+              # --- check-run summary (Markdown, no heredoc to avoid YAML pipe conflicts) ---
+              CONFLICT_FILE_LIST=$(echo "$RELEVANT_CONFLICTS" | sed 's/^/  /')
+              SUMMARY=$(printf '%s\n' \
+                "## Merge Conflicts Detected" \
+                "" \
+                "| Field | Value |" \
+                "|---|---|" \
+                "| PR | #${PR} - ${TITLE} |" \
+                "| Base | ${BASE_REF} @ ${BASE_SHA} |" \
+                "| Head | ${HEAD_REF} @ ${HEAD_SHA} |" \
+                "| Total files changed | ${TOTAL_FILES} |" \
+                "| Conflicted files | ${CONFLICT_COUNT} |" \
+                "" \
+                "### Conflicted files" \
+                '```' \
+                "${CONFLICT_FILE_LIST}" \
+                '```' \
+                "" \
+                "### Remediation" \
+                "1. Pull the latest ${BASE_REF} into your branch:" \
+                '   ```bash' \
+                "   git fetch origin" \
+                "   git merge origin/${BASE_REF}" \
+                "   # or" \
+                "   git rebase origin/${BASE_REF}" \
+                '   ```' \
+                "2. Resolve the conflicts listed above, then commit and push." \
+                "3. This check will re-run automatically once your branch is updated." \
+              )
+
+              gh api "repos/${{ github.repository }}/check-runs" \
                 -X POST \
                 -f name="$CHECK_NAME" \
                 -f head_sha="$HEAD_SHA" \
                 -f status="completed" \
                 -f conclusion="failure" \
-                -f "output[title]=Merge conflicts detected" \
-                -f "output[summary]=Please update your branch." \
+                -f "output[title]=Merge conflicts detected in ${CONFLICT_COUNT} file(s)" \
+                -f "output[summary]=$SUMMARY" \
                 --silent
 
               FAILED=true
-            else
-              echo "✅ Clean PR #$PR"
 
-              gh api repos/${{ github.repository }}/check-runs \
+            else
+              echo "✅  PR #$PR — no relevant conflicts (merge-tree exit=$MERGE_CODE)"
+
+              # --- structured console log ---
+              echo ""
+              echo "  [CLEAN DETAILS]"
+              echo "  PR number           : #$PR"
+              echo "  PR title            : $TITLE"
+              echo "  Base ref            : $BASE_REF  ($BASE_SHA)"
+              echo "  Head ref            : $HEAD_REF  ($HEAD_SHA)"
+              echo "  Total files changed : $TOTAL_FILES"
+              echo "  Conflicted files    : 0"
+              echo ""
+
+              # --- check-run summary (Markdown, no heredoc to avoid YAML pipe conflicts) ---
+              SUMMARY=$(printf '%s\n' \
+                "## No Merge Conflicts" \
+                "" \
+                "| Field | Value |" \
+                "|---|---|" \
+                "| PR | #${PR} - ${TITLE} |" \
+                "| Base | ${BASE_REF} @ ${BASE_SHA} |" \
+                "| Head | ${HEAD_REF} @ ${HEAD_SHA} |" \
+                "| Total files changed | ${TOTAL_FILES} |" \
+                "| Conflicted files | 0 |" \
+                "" \
+                "This PR merges cleanly into ${BASE_REF}." \
+              )
+
+              gh api "repos/${{ github.repository }}/check-runs" \
                 -X POST \
                 -f name="$CHECK_NAME" \
                 -f head_sha="$HEAD_SHA" \
                 -f status="completed" \
                 -f conclusion="success" \
-                -f "output[title]=No merge conflicts" \
-                -f "output[summary]=PR merges cleanly." \
+                -f "output[title]=No merge conflicts - ${TOTAL_FILES} file(s) checked" \
+                -f "output[summary]=$SUMMARY" \
                 --silent
             fi
 
           done < pr_numbers.txt
 
+          echo "========================================"
           if [ "$FAILED" = true ]; then
-            echo "Some PRs have conflicts"
+            echo "Result: one or more PRs have relevant conflicts"
+            exit 0   # job stays green; failure signal lives on individual check-runs
           else
-            echo "All PRs clean"
+            echo "Result: all PRs are clean"
           fi
